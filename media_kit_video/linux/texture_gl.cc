@@ -46,6 +46,7 @@ struct _TextureGL {
   guint32 current_width;
   guint32 current_height;
   VideoOutput* video_output;
+  gint recreate_after_idle; /* Set from mpv's render thread. */
 };
 
 G_DEFINE_TYPE(TextureGL, texture_gl, fl_texture_gl_get_type())
@@ -58,6 +59,14 @@ static void texture_gl_init(TextureGL* self) {
   self->current_width = 1;
   self->current_height = 1;
   self->video_output = NULL;
+  self->recreate_after_idle = 0;
+}
+
+void texture_gl_recreate_after_idle(TextureGL* self) {
+  if (self == NULL) {
+    return;
+  }
+  g_atomic_int_set(&self->recreate_after_idle, 1);
 }
 
 static void texture_gl_dispose(GObject* object) {
@@ -139,8 +148,13 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
     gboolean first_frame = self->name == 0 || self->fbo == 0 || self->mpv_texture == 0;
     gboolean resize = self->current_width != required_width ||
                       self->current_height != required_height;
+    gboolean recreate =
+        g_atomic_int_compare_and_exchange(&self->recreate_after_idle, 1, 0);
+    if (recreate && !first_frame) {
+      g_print("media_kit: TextureGL: Recreating EGLImage after render idle.\n");
+    }
     
-    if (first_frame || resize) {
+    if (first_frame || resize || recreate) {
       // Save Flutter's current EGL context
       EGLDisplay flutter_display = eglGetCurrentDisplay();
       EGLContext flutter_context = eglGetCurrentContext();

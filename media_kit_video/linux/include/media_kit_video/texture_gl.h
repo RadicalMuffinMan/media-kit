@@ -23,6 +23,13 @@ G_DECLARE_FINAL_TYPE(TextureGL, texture_gl, TEXTURE_GL, TEXTURE_GL, FlTextureGL)
 TextureGL* texture_gl_new(VideoOutput* video_output);
 
 /**
+ * @brief Marks the texture for rebuild on the next frame.
+ *
+ * Safe to call from mpv's render thread.
+ */
+void texture_gl_recreate_after_idle(TextureGL* self);
+
+/**
  * @brief Populates texture with video frame.
  */
 gboolean texture_gl_populate_texture(FlTextureGL* texture,

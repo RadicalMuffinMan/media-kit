@@ -33,9 +33,25 @@ struct _VideoOutput {
   gpointer texture_update_callback_context;
   FlTextureRegistrar* texture_registrar;
   gboolean destroyed;
+  gint64 last_frame_notification_us; /* Only touched on mpv's render thread. */
+  gint frame_notification_pending;
 };
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
+
+/* An EGLImage that NVIDIA has left idle under Wayland stops presenting new
+   frames, so a gap this long means the texture behind it has to be rebuilt. */
+#define RENDER_IDLE_RECREATE_US (30 * G_USEC_PER_SEC)
+
+static gboolean video_output_deliver_frame_notification(gpointer data) {
+  VideoOutput* self = (VideoOutput*)data;
+  g_atomic_int_set(&self->frame_notification_pending, 0);
+  if (!self->destroyed && self->texture_gl != NULL) {
+    fl_texture_registrar_mark_texture_frame_available(
+        self->texture_registrar, FL_TEXTURE(self->texture_gl));
+  }
+  return G_SOURCE_REMOVE;
+}
 
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
@@ -115,6 +131,8 @@ static void video_output_init(VideoOutput* self) {
   self->texture_update_callback_context = NULL;
   self->texture_registrar = NULL;
   self->destroyed = FALSE;
+  self->last_frame_notification_us = 0;
+  self->frame_notification_pending = 0;
   g_mutex_init(&self->mutex);
 }
 
@@ -225,8 +243,23 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                       if (self->destroyed) {
                         return;
                       }
-                      fl_texture_registrar_mark_texture_frame_available(
-                          self->texture_registrar, FL_TEXTURE(self->texture_gl));
+                      const gint64 now = g_get_monotonic_time();
+                      if (self->last_frame_notification_us > 0 &&
+                          now - self->last_frame_notification_us >=
+                              RENDER_IDLE_RECREATE_US) {
+                        texture_gl_recreate_after_idle(self->texture_gl);
+                      }
+                      self->last_frame_notification_us = now;
+                      /* mpv calls this from its own render thread, so hand
+                         the notification to the main thread. The reference
+                         keeps this output alive until it runs. */
+                      if (g_atomic_int_compare_and_exchange(
+                              &self->frame_notification_pending, 0, 1)) {
+                        g_main_context_invoke_full(
+                            NULL, G_PRIORITY_HIGH_IDLE,
+                            video_output_deliver_frame_notification,
+                            g_object_ref(self), g_object_unref);
+                      }
                     },
                     self);
                 hardware_acceleration_supported = TRUE;
