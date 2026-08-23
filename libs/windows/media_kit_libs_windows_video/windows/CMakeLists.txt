@@ -64,19 +64,30 @@ function(check_directory_exists_and_not_empty dir result_var)
   endif()
 endfunction()
 
-# Detect architecture and set appropriate libmpv archive
-if(${FLUTTER_TARGET_PLATFORM} STREQUAL "windows-x64")
-  set(LIBMPV_ARCH "x86_64")
-  set(LIBMPV "mpv-dev-x86_64-20241021-git-0f78584.7z")
-  set(LIBMPV_MD5 "6ecf18e85b093c3f7edb16f3ee6603f3")
-else()
-  set(LIBMPV_ARCH "aarch64")
-  set(LIBMPV "mpv-dev-aarch64-20241021-git-0f78584.7z")
-  set(LIBMPV_MD5 "5b507a35db13eee6cb7eb21e8be7c83d")
+# Both arches take shinchiro's libmpv rather than the media-kit archives. Those
+# pass --disable-decoders and re-enable an allowlist that leaves out pgssub, so
+# a PGS track stayed listed and selectable while mpv had no decoder to turn a
+# sample into a picture. shinchiro's build excludes only libaom_av1, so every
+# other decoder is present. The download points at the SourceForge mirror
+# because the matching GitHub releases are pruned once thirty newer builds
+# exist.
+#
+# Flutter sets FLUTTER_TARGET_PLATFORM to "windows-x64" or "windows-arm64", but
+# leaves it unset when this package is configured on its own, and dereferencing
+# it unset makes the if() below a syntax error.
+if(NOT DEFINED FLUTTER_TARGET_PLATFORM)
+  set(FLUTTER_TARGET_PLATFORM "windows-x64")
 endif()
 
-# Download URL for the libmpv archive from the latest release
-set(LIBMPV_URL "https://github.com/media-kit/libmpv-win32-video-cmake/releases/download/20241021/${LIBMPV}")
+if(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64")
+  set(LIBMPV "mpv-dev-aarch64-20260607-git-71ebd08.7z")
+  set(LIBMPV_MD5 "c1ffe70ca6f4c17dc4b2ff0e28b49ea2")
+else()
+  set(LIBMPV "mpv-dev-x86_64-20260607-git-71ebd08.7z")
+  set(LIBMPV_MD5 "650a6c8fde5855a7cb3e219616d5d5f2")
+endif()
+
+set(LIBMPV_URL "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/${LIBMPV}")
 
 # Download location of the libmpv archive.
 set(LIBMPV_ARCHIVE "${CMAKE_BINARY_DIR}/${LIBMPV}")
@@ -90,8 +101,24 @@ download_and_verify(
 
 check_directory_exists_and_not_empty(${LIBMPV_SRC} LIBMPV_SRC_VALID)
 
-# Find 7zip for extraction (preferred for .7z files)
-find_program(SEVENZ_EXECUTABLE NAMES 7z 7za)
+# The ARM64 archives use the 7-Zip ARM64 BCJ branch filter (codec 0x0a, added
+# in 7-Zip 23.00), which the libarchive bundled inside the VS2022 CMake has no
+# decoder for. Depending on the archive, cmake -E tar either stops with a codec
+# error or writes out a DLL of the right size holding the wrong bytes, so
+# reaching a real 7-Zip is load bearing rather than a convenience.
+find_program(SEVENZ_EXECUTABLE
+  NAMES 7z 7za 7zr
+  HINTS "$ENV{ProgramW6432}/7-Zip" "$ENV{ProgramFiles}/7-Zip"
+        "$ENV{ProgramFiles\(x86\)}/7-Zip" "C:/Program Files/7-Zip"
+)
+
+function(require_sevenzip_on_arm64 archive_name)
+  if(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64" AND NOT SEVENZ_EXECUTABLE)
+    message(FATAL_ERROR
+      "7-Zip is required to extract the ARM64 ${archive_name} archive. "
+      "Install 7-Zip 23.00 or newer.")
+  endif()
+endfunction()
 
 # Extract the libmpv archive.
 if(NOT LIBMPV_SRC_VALID)
@@ -99,12 +126,13 @@ if(NOT LIBMPV_SRC_VALID)
   make_directory("${LIBMPV_SRC}")
   add_custom_target("${PROJECT_NAME}_LIBMPV_EXTRACT" ALL)
   
+  require_sevenzip_on_arm64("libmpv")
   if(SEVENZ_EXECUTABLE)
     message(STATUS "Using 7zip for extraction: ${SEVENZ_EXECUTABLE}")
     add_custom_command(
       TARGET "${PROJECT_NAME}_LIBMPV_EXTRACT"
       POST_BUILD
-      COMMAND "${SEVENZ_EXECUTABLE}" x -y "\"${LIBMPV_ARCHIVE}\""
+      COMMAND "${SEVENZ_EXECUTABLE}" x -y "-o${LIBMPV_SRC}" "\"${LIBMPV_ARCHIVE}\""
       COMMAND xcopy "\"${LIBMPV_SRC}/include/mpv\"" "\"${LIBMPV_SRC}/mpv\"" /E /H /C /I
       COMMAND rmdir "\"${LIBMPV_SRC}/include\"" /S /Q
       COMMAND ren "\"${LIBMPV_SRC}/mpv\"" "\"include\""
@@ -126,12 +154,18 @@ endif()
 
 # ------------------------------------------------------------------------------
 
-# ANGLE archive containing the pre-built shared libraries & headers.
-set(ANGLE "ANGLE.7z")
-
-# Download URL & MD5 hash of the ANGLE archive.
-set(ANGLE_URL "https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z")
-set(ANGLE_MD5 "e866f13e8d552348058afaafe869b1ed")
+# ANGLE archive containing the pre-built shared libraries & headers. The
+# upstream archive is x64 only, so ARM64 takes libEGL and libGLESv2 built for
+# aarch64 from the fork behind media-kit's own Windows ARM64 work.
+if(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64")
+  set(ANGLE "ANGLE_WINARM64.7z")
+  set(ANGLE_URL "https://github.com/talynone/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE_WINARM64.7z")
+  set(ANGLE_MD5 "b56aaae894ccf6c8ee90b59ee642a787")
+else()
+  set(ANGLE "ANGLE.7z")
+  set(ANGLE_URL "https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z")
+  set(ANGLE_MD5 "e866f13e8d552348058afaafe869b1ed")
+endif()
 
 # Download location of the ANGLE archive.
 set(ANGLE_ARCHIVE "${CMAKE_BINARY_DIR}/${ANGLE}")
@@ -151,12 +185,13 @@ if(NOT ANGLE_SRC_VALID)
   make_directory("${ANGLE_SRC}")
   add_custom_target("${PROJECT_NAME}_ANGLE_EXTRACT" ALL)
   
+  require_sevenzip_on_arm64("ANGLE")
   if(SEVENZ_EXECUTABLE)
     message(STATUS "Using 7zip for extraction: ${SEVENZ_EXECUTABLE}")
     add_custom_command(
       TARGET "${PROJECT_NAME}_ANGLE_EXTRACT"
       POST_BUILD
-      COMMAND "${SEVENZ_EXECUTABLE}" x -y "\"${ANGLE_ARCHIVE}\""
+      COMMAND "${SEVENZ_EXECUTABLE}" x -y "-o${ANGLE_SRC}" "\"${ANGLE_ARCHIVE}\""
       WORKING_DIRECTORY "${ANGLE_SRC}"
     )
   else()
@@ -212,5 +247,17 @@ set(
   "${ANGLE_SRC}/vk_swiftshader.dll"
   "${ANGLE_SRC}/vulkan-1.dll"
   "${ANGLE_SRC}/zlib.dll"
+)
+
+# The ARM64 ANGLE DLLs link libc++.dll dynamically. It ships in the ARM64
+# archive and is absent from the x64 one, so listing it unconditionally would
+# break x64 packaging.
+if(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64")
+  list(APPEND media_kit_libs_windows_video_bundled_libraries "${ANGLE_SRC}/libc++.dll")
+endif()
+
+set(
+  media_kit_libs_windows_video_bundled_libraries
+  "${media_kit_libs_windows_video_bundled_libraries}"
   PARENT_SCOPE
 )
