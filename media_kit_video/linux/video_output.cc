@@ -33,11 +33,19 @@ struct _VideoOutput {
   gpointer texture_update_callback_context;
   FlTextureRegistrar* texture_registrar;
   gboolean destroyed;
-  gint64 last_frame_notification_us; /* Only touched on mpv's render thread. */
+  gint64 last_frame_notification_us; /* Only touched on mpv's update callback. */
   gint frame_notification_pending;
+  GMutex render_size_lock; /* Keeps width and height a matched pair. */
+  gint render_width; /* Guarded by |render_size_lock|. */
+  gint render_height;
+  gint render_size_pending;
 };
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
+
+static void video_output_set_render_size(VideoOutput* self,
+                                         gint width,
+                                         gint height);
 
 /* An EGLImage that NVIDIA has left idle under Wayland stops presenting new
    frames, so a gap this long means the texture behind it has to be rebuilt. */
@@ -55,8 +63,16 @@ static gboolean video_output_deliver_frame_notification(gpointer data) {
 
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
+  // Can run twice: a frame notice the render thread posts while this runs
+  // takes a reference, and GLib disposes again when that one is dropped.
   self->destroyed = TRUE;
   
+  // mpv allows one mpv_render_* call at a time, so the render thread stops
+  // first. That also frees mpv's EGL context for the cleanup below. An update
+  // arriving meanwhile only sets a flag.
+  if (self->texture_gl) {
+    texture_gl_stop(self->texture_gl);
+  }
   // Make sure that no more callbacks are invoked from mpv.
   if (self->render_context) {
     mpv_render_context_set_update_callback(self->render_context, NULL, NULL);
@@ -108,25 +124,35 @@ static void video_output_dispose(GObject* object) {
     }
     
     g_object_unref(self->texture_gl);
+    self->texture_gl = NULL;
   }
   // S/W
   if (self->texture_sw) {
     fl_texture_registrar_unregister_texture(self->texture_registrar,
                                             FL_TEXTURE(self->texture_sw));
     g_free(self->pixel_buffer);
+    self->pixel_buffer = NULL;
     g_object_unref(self->texture_sw);
+    self->texture_sw = NULL;
     if (self->render_context != NULL) {
       mpv_render_context_free(self->render_context);
       self->render_context = NULL;
     }
   }
   
-  g_mutex_clear(&self->mutex);
   G_OBJECT_CLASS(video_output_parent_class)->dispose(object);
+}
+
+static void video_output_finalize(GObject* object) {
+  VideoOutput* self = VIDEO_OUTPUT(object);
+  g_mutex_clear(&self->mutex);
+  g_mutex_clear(&self->render_size_lock);
+  G_OBJECT_CLASS(video_output_parent_class)->finalize(object);
 }
 
 static void video_output_class_init(VideoOutputClass* klass) {
   G_OBJECT_CLASS(klass)->dispose = video_output_dispose;
+  G_OBJECT_CLASS(klass)->finalize = video_output_finalize;
 }
 
 static void video_output_init(VideoOutput* self) {
@@ -147,6 +173,10 @@ static void video_output_init(VideoOutput* self) {
   self->destroyed = FALSE;
   self->last_frame_notification_us = 0;
   self->frame_notification_pending = 0;
+  g_mutex_init(&self->render_size_lock);
+  self->render_width = 0;
+  self->render_height = 0;
+  self->render_size_pending = 0;
   g_mutex_init(&self->mutex);
 }
 
@@ -208,6 +238,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   self->width = configuration.width;
   self->height = configuration.height;
   self->configuration = configuration;
+  if (configuration.width > 0 && configuration.height > 0) {
+    self->render_width = (gint)configuration.width;
+    self->render_height = (gint)configuration.height;
+  }
 #ifndef MPV_RENDER_API_TYPE_SW
   // MPV_RENDER_API_TYPE_SW must be available for S/W rendering.
   if (!self->configuration.enable_hardware_acceleration) {
@@ -326,16 +360,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                         texture_gl_recreate_after_idle(self->texture_gl);
                       }
                       self->last_frame_notification_us = now;
-                      /* mpv calls this from its own render thread, so hand
-                         the notification to the main thread. The reference
-                         keeps this output alive until it runs. */
-                      if (g_atomic_int_compare_and_exchange(
-                              &self->frame_notification_pending, 0, 1)) {
-                        g_main_context_invoke_full(
-                            NULL, G_PRIORITY_HIGH_IDLE,
-                            video_output_deliver_frame_notification,
-                            g_object_ref(self), g_object_unref);
-                      }
+                      texture_gl_request_render(self->texture_gl);
                     },
                     self);
                 hardware_acceleration_supported = TRUE;
@@ -350,6 +375,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
             video_output_restore_egl(flutter_display, flutter_draw_surface,
                                      flutter_read_surface, flutter_context,
                                      self->egl_display);
+            // Only now is mpv's EGL context free to move to its thread.
+            if (hardware_acceleration_supported) {
+              texture_gl_start(self->texture_gl);
+            }
           } else {
             g_printerr("media_kit: VideoOutput: Failed to make isolated EGL context current. Error: 0x%x\n", eglGetError());
           }
@@ -453,6 +482,15 @@ void video_output_set_size(VideoOutput* self, gint64 width, gint64 height) {
   if (self->texture_gl) {
     self->width = width;
     self->height = height;
+    if (width > 0 && height > 0) {
+      video_output_set_render_size(self, (gint)width, (gint)height);
+      // Paused, mpv sends no further frame, so redraw at the new size now.
+      texture_gl_request_redraw(self->texture_gl);
+    } else {
+      // Back to the video's own size, which only mpv knows.
+      video_output_set_render_size(self, 0, 0);
+      video_output_request_render_size(self);
+    }
   }
   // S/W
   if (self->texture_sw) {
@@ -602,4 +640,73 @@ void video_output_notify_texture_update(VideoOutput* self) {
   if (self->texture_update_callback != NULL) {
     self->texture_update_callback(id, width, height, context);
   }
+}
+
+void video_output_get_render_size(VideoOutput* self, gint* width, gint* height) {
+  g_mutex_lock(&self->render_size_lock);
+  *width = self->render_width;
+  *height = self->render_height;
+  g_mutex_unlock(&self->render_size_lock);
+}
+
+static void video_output_set_render_size(VideoOutput* self,
+                                         gint width,
+                                         gint height) {
+  g_mutex_lock(&self->render_size_lock);
+  self->render_width = width;
+  self->render_height = height;
+  g_mutex_unlock(&self->render_size_lock);
+}
+
+static gboolean video_output_resolve_render_size(gpointer data) {
+  VideoOutput* self = (VideoOutput*)data;
+  g_atomic_int_set(&self->render_size_pending, 0);
+  if (self->destroyed || self->texture_gl == NULL) {
+    return G_SOURCE_REMOVE;
+  }
+  // Asks mpv's core, so it must not run on the render thread: the core can be
+  // waiting on mpv's video thread, which waits on the render thread. Only
+  // needed until the first SetSize: NativeVideoController calls SetSize with
+  // the video's own size whenever mpv's video-params change.
+  const gint64 width = video_output_get_width(self);
+  const gint64 height = video_output_get_height(self);
+  if (width > 0 && height > 0) {
+    video_output_set_render_size(self, (gint)width, (gint)height);
+    texture_gl_request_render(self->texture_gl);
+  }
+  // Otherwise mpv has no video yet, and its next frame asks again.
+  return G_SOURCE_REMOVE;
+}
+
+void video_output_request_render_size(VideoOutput* self) {
+  if (g_atomic_int_compare_and_exchange(&self->render_size_pending, 0, 1)) {
+    g_idle_add_full(G_PRIORITY_HIGH_IDLE, video_output_resolve_render_size,
+                    g_object_ref(self), g_object_unref);
+  }
+}
+
+void video_output_post_frame_available(VideoOutput* self) {
+  /* Flutter has to be told on the main thread. The reference keeps this
+     output alive until it runs. An idle source, never an invoke: with no
+     thread owning the main context (at exit), g_main_context_invoke would run
+     the callback right here on the render thread. */
+  if (g_atomic_int_compare_and_exchange(&self->frame_notification_pending, 0,
+                                        1)) {
+    g_idle_add_full(G_PRIORITY_HIGH_IDLE,
+                    video_output_deliver_frame_notification, g_object_ref(self),
+                    g_object_unref);
+  }
+}
+
+static gboolean video_output_deliver_texture_update(gpointer data) {
+  VideoOutput* self = (VideoOutput*)data;
+  if (!self->destroyed) {
+    video_output_notify_texture_update(self);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void video_output_post_texture_update(VideoOutput* self) {
+  g_idle_add_full(G_PRIORITY_DEFAULT, video_output_deliver_texture_update,
+                  g_object_ref(self), g_object_unref);
 }

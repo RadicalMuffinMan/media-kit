@@ -108,4 +108,27 @@ gint64 video_output_get_texture_id(VideoOutput* self);
 
 void video_output_notify_texture_update(VideoOutput* self);
 
+/**
+ * @brief Size the H/W render thread draws at. Never calls into mpv, so it is
+ * safe off the main thread. 0 x 0 until the size is known.
+ */
+void video_output_get_render_size(VideoOutput* self, gint* width, gint* height);
+
+/**
+ * @brief Asks the main thread to look the video size up in mpv, then to wake
+ * the render thread. Safe from any thread.
+ */
+void video_output_request_render_size(VideoOutput* self);
+
+/**
+ * @brief Tells Flutter a new frame is ready. Safe from any thread.
+ */
+void video_output_post_frame_available(VideoOutput* self);
+
+/**
+ * @brief Runs |video_output_notify_texture_update| on the main thread. Safe
+ * from any thread.
+ */
+void video_output_post_texture_update(VideoOutput* self);
+
 #endif  // VIDEO_OUTPUT_H_
