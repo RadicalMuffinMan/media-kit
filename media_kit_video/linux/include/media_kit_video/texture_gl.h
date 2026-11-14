@@ -23,11 +23,39 @@ G_DECLARE_FINAL_TYPE(TextureGL, texture_gl, TEXTURE_GL, TEXTURE_GL, FlTextureGL)
 TextureGL* texture_gl_new(VideoOutput* video_output);
 
 /**
- * @brief Marks the texture for rebuild on the next frame.
+ * @brief Marks every texture for rebuild the next time it is drawn into.
  *
- * Safe to call from mpv's render thread.
+ * Safe from any thread, including mpv's update callback.
  */
 void texture_gl_recreate_after_idle(TextureGL* self);
+
+/**
+ * @brief Starts the thread that renders mpv's frames.
+ *
+ * Call on the main thread once the mpv render context exists and mpv's EGL
+ * context is no longer current anywhere. The thread makes it current and keeps
+ * it until |texture_gl_stop|.
+ */
+void texture_gl_start(TextureGL* self);
+
+/**
+ * @brief Asks the render thread for a frame. Safe from any thread, including
+ * mpv's update callback.
+ */
+void texture_gl_request_render(TextureGL* self);
+
+/**
+ * @brief Like |texture_gl_request_render|, but only once mpv has produced a
+ * frame. For redraws the app asks for, such as a new size.
+ */
+void texture_gl_request_redraw(TextureGL* self);
+
+/**
+ * @brief Stops the render thread and frees the GL objects it owns. Returns once
+ * mpv's EGL context is no longer current on it. Call on the main thread before
+ * freeing the mpv render context.
+ */
+void texture_gl_stop(TextureGL* self);
 
 /**
  * @brief Populates texture with video frame.
