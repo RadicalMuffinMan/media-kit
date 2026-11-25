@@ -53,6 +53,7 @@ class NativeReferenceHolder {
       final address = _referenceBuffer.address;
       await _file.write_(address.toString());
       print('$kTag Allocated $address');
+      await _deleteStaleFiles();
     } else {
       // Locate reference buffer.
       final address = int.parse((await _file.readAsString_())!);
@@ -120,12 +121,100 @@ class NativeReferenceHolder {
 
   /// [File] used to store [int] address to the reference buffer.
   /// This is necessary to have a persistent to the reference buffer across hot-restarts.
+  ///
+  /// The file outlives the process (on Android it sits in the app's files
+  /// directory), so its name carries the process start time where procfs
+  /// gives one. Keyed by the PID alone, a later process that reused the PID
+  /// read a dead process's address and crashed.
   final File _file = File(
-    path.join(
-      TempFile.directory,
-      'com.alexmercerind.media_kit.NativeReferenceHolder.$pid',
-    ),
+    path.join(TempFile.directory, '$kFilePrefix${processKey(pid)}'),
   );
+
+  /// Removes files left by processes that have ended, which otherwise pile up
+  /// with every launch. Only where procfs can tell a live process apart.
+  Future<void> _deleteStaleFiles() async {
+    if (!File('/proc/self/stat').existsSync()) return;
+    final own = path.basename(_file.path);
+    try {
+      await for (final entity in Directory(TempFile.directory).list()) {
+        final name = path.basename(entity.path);
+        if (!name.startsWith(kFilePrefix) || name == own) continue;
+        final key = name.substring(kFilePrefix.length);
+        final owner = int.tryParse(key.split('.').first);
+        if (owner == null) continue;
+        // A bare PID may be a live process on an older media_kit, so only an
+        // ended one goes. A keyed file also goes once its PID was reused.
+        if (!_isAlive(owner) ||
+            (key.contains('.') && processKey(owner) != key)) {
+          try {
+            await entity.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Android refuses the lookup for another user's process rather than
+  /// answering, which still means one is running under that PID.
+  static bool _isAlive(int pid) {
+    try {
+      return Directory('/proc/$pid').existsSync();
+    } on FileSystemException {
+      return true;
+    }
+  }
+
+  /// [pid] with its start time and boot from procfs, so a hot-restart in the
+  /// same process finds its own file and a new process with a reused PID
+  /// doesn't. Just [pid] where procfs is missing or the process has ended.
+  static String processKey(int pid) {
+    try {
+      return processKeyFromProcfs(
+            pid: pid,
+            stat: File('/proc/$pid/stat').readAsStringSync(),
+            boot: _boot,
+          ) ??
+          '$pid';
+    } catch (_) {
+      return '$pid';
+    }
+  }
+
+  /// Tells boots apart, since a start time counts from boot. Android keeps
+  /// `/proc/stat` from apps, so it falls back to the kernel's boot id there.
+  static final String _boot = () {
+    final reads = <String Function()>[
+      () => File('/proc/stat')
+          .readAsLinesSync()
+          .firstWhere((line) => line.startsWith('btime '))
+          .substring(6)
+          .trim(),
+      () => File('/proc/sys/kernel/random/boot_id').readAsStringSync().trim(),
+    ];
+    for (final read in reads) {
+      try {
+        return read();
+      } catch (_) {}
+    }
+    return '';
+  }();
+
+  /// Builds the key from the contents of `/proc/<pid>/stat` and [boot].
+  static String? processKeyFromProcfs({
+    required int pid,
+    required String stat,
+    required String boot,
+  }) {
+    // The process name in parentheses can hold spaces, so fields are counted
+    // from after its closing parenthesis, which leaves field 3 (state) first
+    // and field 22 (starttime) at index 19.
+    final fields = stat.substring(stat.lastIndexOf(')') + 2).split(' ');
+    if (fields.length < 20) return null;
+    return [pid, fields[19], if (boot.isNotEmpty) boot].join('.');
+  }
+
+  static const String kFilePrefix =
+      'com.alexmercerind.media_kit.NativeReferenceHolder.';
 
   /// [Pointer] to the reference buffer.
   late final Pointer<IntPtr> _referenceBuffer;
